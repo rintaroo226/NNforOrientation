@@ -100,12 +100,13 @@ def main() -> None:
 
     model = SilhouettePoseNet().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     best_angle = float("inf")
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
 
     n_train_batches = len(train_loader)
-    log_interval = max(1, n_train_batches // 4)  # エポック内4回表示
+    log_interval = max(1, n_train_batches // 10)  # エポック内10回表示
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -132,13 +133,15 @@ def main() -> None:
                     flush=True,
                 )
 
+        scheduler.step()
         val_loss, val_angle = evaluate(model, val_loader, device)
         train_loss /= train_count
         print(
             f"epoch={epoch:03d}/{args.epochs} "
             f"train_loss={train_loss:.4f} "
             f"val_loss={val_loss:.4f} "
-            f"val_angle_deg={val_angle:.2f}",
+            f"val_angle_deg={val_angle:.2f} "
+            f"lr={scheduler.get_last_lr()[0]:.2e}",
             flush=True,
         )
 
