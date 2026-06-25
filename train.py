@@ -106,7 +106,7 @@ def main() -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
 
     n_train_batches = len(train_loader)
-    log_interval = max(1, n_train_batches // 10)  # エポック内10回表示
+    log_interval = max(1, n_train_batches // 2)  # エポック内2回表示
 
     for epoch in range(1, args.epochs + 1):
         model.train()
