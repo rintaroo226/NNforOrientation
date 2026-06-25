@@ -5,7 +5,6 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, random_split
-from tqdm.auto import tqdm
 
 from silhouette_pose.dataset import SilhouettePoseDataset
 from silhouette_pose.losses import quaternion_angle_error_deg, quaternion_loss
@@ -105,12 +104,14 @@ def main() -> None:
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
 
+    n_train_batches = len(train_loader)
+    log_interval = max(1, n_train_batches // 4)  # エポック内4回表示
+
     for epoch in range(1, args.epochs + 1):
         model.train()
         train_loss = 0.0
         train_count = 0
-        pbar = tqdm(train_loader, desc=f"epoch {epoch:03d}/{args.epochs}", leave=False)
-        for x, y in pbar:
+        for batch_idx, (x, y) in enumerate(train_loader, 1):
             x = x.to(device)
             y = y.to(device)
             pred = model(x)
@@ -122,7 +123,14 @@ def main() -> None:
 
             train_loss += float(loss.item()) * x.size(0)
             train_count += x.size(0)
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+            if batch_idx % log_interval == 0 or batch_idx == n_train_batches:
+                print(
+                    f"  epoch={epoch:03d}/{args.epochs}"
+                    f"  batch={batch_idx}/{n_train_batches}"
+                    f"  loss={loss.item():.4f}",
+                    flush=True,
+                )
 
         val_loss, val_angle = evaluate(model, val_loader, device)
         train_loss /= train_count
@@ -130,7 +138,8 @@ def main() -> None:
             f"epoch={epoch:03d}/{args.epochs} "
             f"train_loss={train_loss:.4f} "
             f"val_loss={val_loss:.4f} "
-            f"val_angle_deg={val_angle:.2f}"
+            f"val_angle_deg={val_angle:.2f}",
+            flush=True,
         )
 
         if val_angle < best_angle:
