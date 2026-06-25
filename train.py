@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, random_split
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 from silhouette_pose.dataset import SilhouettePoseDataset
 from silhouette_pose.losses import quaternion_angle_error_deg, quaternion_loss
