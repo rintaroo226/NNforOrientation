@@ -7,7 +7,10 @@ import torch
 from torch.utils.data import DataLoader, random_split
 
 from silhouette_pose.dataset import SilhouettePoseDataset
-from silhouette_pose.losses import quaternion_angle_error_deg, quaternion_loss
+from silhouette_pose.losses import (
+    symmetry_aware_angle_error_deg,
+    symmetry_aware_quaternion_loss,
+)
 from silhouette_pose.model import SilhouettePoseNet
 
 
@@ -56,8 +59,8 @@ def evaluate(
             x = x.to(device)
             y = y.to(device)
             pred = model(x)
-            loss = quaternion_loss(pred, y)
-            angle = quaternion_angle_error_deg(pred, y)
+            loss = symmetry_aware_quaternion_loss(pred, y)
+            angle = symmetry_aware_angle_error_deg(pred, y)
             batch = x.size(0)
             total_loss += float(loss.item()) * batch
             total_angle += float(angle.mean().item()) * batch
@@ -116,7 +119,7 @@ def main() -> None:
             x = x.to(device)
             y = y.to(device)
             pred = model(x)
-            loss = quaternion_loss(pred, y)
+            loss = symmetry_aware_quaternion_loss(pred, y)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()

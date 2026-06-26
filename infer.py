@@ -32,7 +32,6 @@ def load_image(path: str | Path, image_size: int) -> torch.Tensor:
         Image.Resampling.BILINEAR,
     )
     arr = np.asarray(image, dtype=np.float32) / 255.0
-    arr = (arr >= 0.5).astype(np.float32)
     return torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)
 
 

@@ -20,7 +20,7 @@ class SilhouettePoseDataset(Dataset):
         root: str | Path,
         labels_csv: str | Path,
         image_size: int = 64,
-        threshold: float | None = 0.5,
+        threshold: float | None = None,
     ) -> None:
         self.root = Path(root)
         self.labels_csv = Path(labels_csv)

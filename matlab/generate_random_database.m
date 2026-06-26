@@ -48,7 +48,8 @@ for i = 1:N
     pose.roll  = rolls(i);
 
     img = renderBoxImage(handles, pose, cam_params);
-    img = img > 0;  % 2値化
+    % グレースケールのまま保存（バイナリ化しない）
+    % 各面が異なる輝度を持つため、前面と背面を区別できる
 
     rel_path = sprintf('images/sample_%06d.png', i);
     imwrite(img, fullfile(save_dir, rel_path));
