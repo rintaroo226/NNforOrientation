@@ -55,6 +55,26 @@ python train.py \
   --batch-size 64
 ```
 
+## Train On Google Colab
+
+Colab's local disk (`/content/...`) is wiped when the runtime disconnects or
+restarts, so point `--output` at a path under a mounted Google Drive to keep
+the checkpoint:
+
+```python
+from google.colab import drive
+drive.mount('/content/drive')
+```
+
+```bash
+!python train.py \
+  --data-root path/to/dataset \
+  --labels-csv path/to/dataset/labels.csv \
+  --epochs 100 \
+  --batch-size 64 \
+  --output /content/drive/MyDrive/silhouette_pose/checkpoints/silhouette_pose.pt
+```
+
 ## Inference
 
 ```bash

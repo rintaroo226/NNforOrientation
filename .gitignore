@@ -7,3 +7,8 @@ __pycache__/
 data/
 checkpoints/
 matlab/database_random/
+matlab/database_random.zip
+
+# OS / エディタ
+.DS_Store
+.claude/

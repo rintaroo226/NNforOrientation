@@ -111,8 +111,8 @@ def quat_to_euler_zyx_deg(q: np.ndarray) -> tuple[float, float, float]:
     return pitch, yaw, roll
 
 
-def best_sym_euler(pred_q: np.ndarray, target_q: np.ndarray) -> tuple[float, float, float]:
-    """最も近い対称等価姿勢の Euler 角を返す。"""
+def nearest_sym_target_quat(pred_q: np.ndarray, target_q: np.ndarray) -> np.ndarray:
+    """対称性を考慮し、pred に最も近い target の等価姿勢クォータニオンを返す。"""
     p = pred_q / max(float(np.linalg.norm(pred_q)), 1e-8)
     t = target_q / max(float(np.linalg.norm(target_q)), 1e-8)
 
@@ -126,8 +126,29 @@ def best_sym_euler(pred_q: np.ndarray, target_q: np.ndarray) -> tuple[float, flo
             best_sym_idx = i
 
     sym = _BOX_SYMMETRIES[best_sym_idx].numpy()
-    nearest_target = _quat_mul_np(t, sym)
-    return quat_to_euler_zyx_deg(nearest_target)
+    return _quat_mul_np(t, sym)
+
+
+def quat_conjugate(q: np.ndarray) -> np.ndarray:
+    return np.array([q[0], -q[1], -q[2], -q[3]], dtype=np.float32)
+
+
+def relative_quat(pred_q: np.ndarray, target_q: np.ndarray) -> np.ndarray:
+    """pred と、対称性考慮済みで最も近い target との相対回転クォータニオン (pred ⊗ target⁻¹)。
+
+    実部の acos から Err と同じ角度が求まり、虚部はズレの回転軸を表す。
+    q と -q は同一回転なので実部が正になるよう符号を揃える。
+    """
+    p = pred_q / max(float(np.linalg.norm(pred_q)), 1e-8)
+    nearest_t = nearest_sym_target_quat(pred_q, target_q)
+    rel = _quat_mul_np(p, quat_conjugate(nearest_t))
+    if rel[0] < 0:
+        rel = -rel
+    return rel
+
+
+def fmt_quat(q: np.ndarray) -> str:
+    return f"({q[0]:+.2f},{q[1]:+.2f},{q[2]:+.2f},{q[3]:+.2f})"
 
 
 def _quat_mul_np(q: np.ndarray, r: np.ndarray) -> np.ndarray:
@@ -258,13 +279,16 @@ def main() -> None:
         else:
             gp, gy, gr = quat_to_euler_zyx_deg(gt_q)
 
-        # 予測 Euler 角 (最も近い対称等価)
+        # 予測 Euler 角 (モデルの生出力そのもの)
         if pred_q is not None:
-            pp, py, pr = best_sym_euler(pred_q, gt_q)
+            pp, py, pr = quat_to_euler_zyx_deg(pred_q)
+            rel_q = relative_quat(pred_q, gt_q)
             lines = [
                 f"GT   P{gp:+6.1f}° Y{gy:+6.1f}° R{gr:+6.1f}°",
+                f"GTq  {fmt_quat(gt_q)}",
                 f"Pred P{pp:+6.1f}° Y{py:+6.1f}° R{pr:+6.1f}°",
-                f"Err  {err:.1f}°",
+                f"Predq{fmt_quat(pred_q)}",
+                f"RelQ {fmt_quat(rel_q)}  Err {err:.1f}°",
             ]
             color = "lime" if err < 20 else ("yellow" if err < 45 else "tomato")
         else:
@@ -308,13 +332,16 @@ def main() -> None:
                 gp, gy, gr = euler_gt[key]
             else:
                 gp, gy, gr = quat_to_euler_zyx_deg(gt_q)
-            pp, py, pr = best_sym_euler(pred_q, gt_q)
+            pp, py, pr = quat_to_euler_zyx_deg(pred_q)
+            rel_q = relative_quat(pred_q, gt_q)
 
             ax.set_title(
                 f"GT   P{gp:+.1f}° Y{gy:+.1f}° R{gr:+.1f}°\n"
+                f"GTq  {fmt_quat(gt_q)}\n"
                 f"Pred P{pp:+.1f}° Y{py:+.1f}° R{pr:+.1f}°\n"
-                f"Err {err:.1f}°",
-                fontsize=7, fontfamily="monospace",
+                f"Predq{fmt_quat(pred_q)}\n"
+                f"RelQ {fmt_quat(rel_q)}  Err {err:.1f}°",
+                fontsize=6.5, fontfamily="monospace",
                 bbox=dict(facecolor="black", alpha=0.7, pad=2),
                 color="lime" if row_idx == 0 else "tomato",
             )
