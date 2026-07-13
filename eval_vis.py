@@ -42,6 +42,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-samples",   type=int, default=16, help="グリッド表示サンプル数")
     p.add_argument("--seed",        type=int, default=0)
     p.add_argument("--out-dir",     default="eval_output")
+    p.add_argument("--err-threshold", type=float, default=45.0,
+                    help="誤答サンプル一覧に含める角度誤差のしきい値 [deg]")
+    p.add_argument("--n-wrong",     type=int, default=20,
+                    help="誤答サンプル一覧に表示する最大枚数")
+    p.add_argument("--box-size",    default="3,2,1",
+                    help="直方体サイズ 幅,高さ,奥行 [m] (generate_random_database.m の target_size と合わせる)")
+    p.add_argument("--cam-distance", type=float, default=10.0,
+                    help="カメラからターゲットまでの距離 [m] (renderBoxImage.m の distance と合わせる)")
+    p.add_argument("--cam-fov",     type=float, default=25.0,
+                    help="カメラ視野角 [deg] (renderBoxImage.m の fov と合わせる)")
     return p.parse_args()
 
 
@@ -151,6 +161,93 @@ def fmt_quat(q: np.ndarray) -> str:
     return f"({q[0]:+.2f},{q[1]:+.2f},{q[2]:+.2f},{q[3]:+.2f})"
 
 
+def sample_title_lines(
+    gp: float, gy: float, gr: float, gt_q: np.ndarray,
+    pred_q: np.ndarray, err: float,
+) -> tuple[list[str], str]:
+    """1サンプル分のタイトル文字列（GT/Pred/RelQ）と誤差に応じた色を返す。"""
+    pp, py, pr = quat_to_euler_zyx_deg(pred_q)
+    rel_q = relative_quat(pred_q, gt_q)
+    lines = [
+        f"GT   P{gp:+6.1f}° Y{gy:+6.1f}° R{gr:+6.1f}°",
+        f"GTq  {fmt_quat(gt_q)}",
+        f"Pred P{pp:+6.1f}° Y{py:+6.1f}° R{pr:+6.1f}°",
+        f"Predq{fmt_quat(pred_q)}",
+        f"RelQ {fmt_quat(rel_q)}  Err {err:.1f}°",
+    ]
+    color = "lime" if err < 20 else ("yellow" if err < 45 else "tomato")
+    return lines, color
+
+
+# ---------------------------------------------------------------------------
+# 直方体ワイヤーフレームの投影 (initBoxSim.m / renderBoxImage.m と同じ配置)
+# ---------------------------------------------------------------------------
+
+_BOX_EDGES = [
+    (0, 1), (1, 2), (2, 3), (3, 0),  # -Z 面
+    (4, 5), (5, 6), (6, 7), (7, 4),  # +Z 面
+    (0, 4), (1, 5), (2, 6), (3, 7),  # 縦の辺
+]
+
+
+def box_vertices(box_size: tuple[float, float, float]) -> np.ndarray:
+    """initBoxSim.m と同じ頂点順序 (原点中心) を返す。"""
+    w, h, d = box_size
+    return np.array([
+        [-w/2, -h/2, -d/2],
+        [ w/2, -h/2, -d/2],
+        [ w/2,  h/2, -d/2],
+        [-w/2,  h/2, -d/2],
+        [-w/2, -h/2,  d/2],
+        [ w/2, -h/2,  d/2],
+        [ w/2,  h/2,  d/2],
+        [-w/2,  h/2,  d/2],
+    ], dtype=np.float32)
+
+
+def quat_to_matrix(q: np.ndarray) -> np.ndarray:
+    """単位クォータニオン [w,x,y,z] を回転行列に変換する (v' = R v)。"""
+    w, x, y, z = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+    return np.array([
+        [1 - 2*(y*y+z*z), 2*(x*y-w*z),     2*(x*z+w*y)],
+        [2*(x*y+w*z),     1 - 2*(x*x+z*z), 2*(y*z-w*x)],
+        [2*(x*z-w*y),     2*(y*z+w*x),     1 - 2*(x*x+y*y)],
+    ], dtype=np.float32)
+
+
+def project_box_edges(
+    q: np.ndarray,
+    box_size: tuple[float, float, float],
+    distance: float,
+    fov_deg: float,
+    img_w: int,
+    img_h: int,
+) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    """クォータニオン姿勢の直方体を、renderBoxImage.m と同じピンホールカメラ
+    (原点にカメラ, +Z 方向を向く, ターゲット中心を [0, 0, distance] に配置) で
+    画像平面へ投影し、12本の辺をピクセル座標のペアのリストとして返す。
+    """
+    v = box_vertices(box_size) @ quat_to_matrix(q).T
+    v[:, 2] += distance
+
+    tan_half = math.tan(math.radians(fov_deg) / 2.0)
+    ndc_x = v[:, 0] / (v[:, 2] * tan_half)
+    ndc_y = v[:, 1] / (v[:, 2] * tan_half)
+    px = (ndc_x + 1.0) / 2.0 * img_w
+    py = (1.0 - (ndc_y + 1.0) / 2.0) * img_h
+
+    return [((px[i], py[i]), (px[j], py[j])) for i, j in _BOX_EDGES]
+
+
+def draw_box_wireframe(
+    ax, q: np.ndarray, box_size: tuple[float, float, float],
+    distance: float, fov_deg: float, img_w: int, img_h: int,
+    color: str, linestyle: str = "-",
+) -> None:
+    for (x0, y0), (x1, y1) in project_box_edges(q, box_size, distance, fov_deg, img_w, img_h):
+        ax.plot([x0, x1], [y0, y1], color=color, linestyle=linestyle, linewidth=1.3)
+
+
 def _quat_mul_np(q: np.ndarray, r: np.ndarray) -> np.ndarray:
     qw, qx, qy, qz = q[0], q[1], q[2], q[3]
     rw, rx, ry, rz = r[0], r[1], r[2], r[3]
@@ -172,6 +269,7 @@ def main() -> None:
     device = choose_device(args.device)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    box_size = tuple(float(v) for v in args.box_size.split(","))
 
     # モデル読み込み
     ckpt = torch.load(args.checkpoint, map_location=device)
@@ -281,16 +379,7 @@ def main() -> None:
 
         # 予測 Euler 角 (モデルの生出力そのもの)
         if pred_q is not None:
-            pp, py, pr = quat_to_euler_zyx_deg(pred_q)
-            rel_q = relative_quat(pred_q, gt_q)
-            lines = [
-                f"GT   P{gp:+6.1f}° Y{gy:+6.1f}° R{gr:+6.1f}°",
-                f"GTq  {fmt_quat(gt_q)}",
-                f"Pred P{pp:+6.1f}° Y{py:+6.1f}° R{pr:+6.1f}°",
-                f"Predq{fmt_quat(pred_q)}",
-                f"RelQ {fmt_quat(rel_q)}  Err {err:.1f}°",
-            ]
-            color = "lime" if err < 20 else ("yellow" if err < 45 else "tomato")
+            lines, color = sample_title_lines(gp, gy, gr, gt_q, pred_q, err)
         else:
             lines = [f"GT P{gp:+.1f}° Y{gy:+.1f}° R{gr:+.1f}°", "no pred"]
             color = "white"
@@ -332,15 +421,10 @@ def main() -> None:
                 gp, gy, gr = euler_gt[key]
             else:
                 gp, gy, gr = quat_to_euler_zyx_deg(gt_q)
-            pp, py, pr = quat_to_euler_zyx_deg(pred_q)
-            rel_q = relative_quat(pred_q, gt_q)
+            lines, _ = sample_title_lines(gp, gy, gr, gt_q, pred_q, err)
 
             ax.set_title(
-                f"GT   P{gp:+.1f}° Y{gy:+.1f}° R{gr:+.1f}°\n"
-                f"GTq  {fmt_quat(gt_q)}\n"
-                f"Pred P{pp:+.1f}° Y{py:+.1f}° R{pr:+.1f}°\n"
-                f"Predq{fmt_quat(pred_q)}\n"
-                f"RelQ {fmt_quat(rel_q)}  Err {err:.1f}°",
+                "\n".join(lines),
                 fontsize=6.5, fontfamily="monospace",
                 bbox=dict(facecolor="black", alpha=0.7, pad=2),
                 color="lime" if row_idx == 0 else "tomato",
@@ -354,6 +438,56 @@ def main() -> None:
     fig.savefig(bw_path, dpi=120)
     plt.close(fig)
     print(f"保存: {bw_path}")
+
+    # -----------------------------------------------------------------------
+    # 図4: 誤答サンプル — 実画像に GT / Pred の直方体ワイヤーフレームを重畳
+    # -----------------------------------------------------------------------
+    wrong_keys = sorted(
+        (k for k in all_pred_quats if all_errors_arr[all_keys.index(k)] >= args.err_threshold),
+        key=lambda k: all_errors_arr[all_keys.index(k)],
+        reverse=True,
+    )[:args.n_wrong]
+
+    if wrong_keys:
+        n_cols = 4
+        n_rows = math.ceil(len(wrong_keys) / n_cols)
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3.5, n_rows * 3.8))
+        axes = np.atleast_1d(axes).flatten()
+
+        for ax, key in zip(axes, wrong_keys):
+            img = Image.open(root / key).convert("L")
+            img_w, img_h = img.size
+            pred_q = all_pred_quats[key]
+            gt_q   = labels[key]
+            err    = float(all_errors_arr[all_keys.index(key)])
+
+            ax.imshow(np.asarray(img), cmap="gray", vmin=0, vmax=255)
+            draw_box_wireframe(ax, gt_q, box_size, args.cam_distance, args.cam_fov,
+                                img_w, img_h, color="lime", linestyle="--")
+            draw_box_wireframe(ax, pred_q, box_size, args.cam_distance, args.cam_fov,
+                                img_w, img_h, color="orange", linestyle="-")
+            ax.set_xlim(0, img_w)
+            ax.set_ylim(img_h, 0)
+            ax.axis("off")
+            ax.set_title(f"Err {err:.1f}°", fontsize=8, color="white",
+                         bbox=dict(facecolor="black", alpha=0.6, pad=2))
+
+        for ax in axes[len(wrong_keys):]:
+            ax.axis("off")
+
+        fig.suptitle(
+            f"誤答サンプル (Err >= {args.err_threshold:.0f}°, "
+            f"{len(wrong_keys)}/{int((all_errors_arr >= args.err_threshold).sum())}件表示)  "
+            f"緑破線=GT姿勢  橙実線=予測姿勢",
+            fontsize=10,
+        )
+        fig.tight_layout()
+        wrong_path = out_dir / "wrong_pose_overlay.png"
+        fig.savefig(wrong_path, dpi=120)
+        plt.close(fig)
+        print(f"保存: {wrong_path}")
+    else:
+        print(f"\nErr >= {args.err_threshold:.0f}° のサンプルはありませんでした。")
 
     print(f"\n完了。結果は {out_dir}/ に保存されました。")
 
