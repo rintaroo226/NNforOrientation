@@ -8,7 +8,7 @@ def normalize_quaternion(q: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
 def quaternion_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
-    eps: float = 1e-4,
+    eps: float = 1e-6,
 ) -> torch.Tensor:
     """Sign-invariant quaternion loss used for silhouette-to-pose learning.
 
@@ -71,7 +71,7 @@ def _best_sym_dots(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 def symmetry_aware_quaternion_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
-    eps: float = 1e-4,
+    eps: float = 1e-6,
 ) -> torch.Tensor:
     """直方体対称性を考慮した quaternion ロス (スカラー)。
 

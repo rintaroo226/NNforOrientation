@@ -8,6 +8,9 @@ data/
 checkpoints/
 matlab/database_random/
 matlab/database_random.zip
+matlab/database_random_fully/
+matlab/database_random_test/
+matlab/database_random*.zip
 
 # OS / エディタ
 .DS_Store

@@ -1,26 +1,21 @@
-% generate_random_database.m
-% SO(3) 上で一様なランダム姿勢（クォータニオン）をサンプリングして
-% 学習用データベースを生成する。
-%
-% pitch/yaw/roll をそれぞれ独立に一様サンプリングすると、
-% 実際の3D回転としては極（pitch=0,180）付近に偏り、
-% yaw=±90°付近（ジンバルロック点）では pitch と roll が
-% 縮退してしまうため、代わりにクォータニオンを直接一様サンプリングし、
-% レンダラーに渡す pitch/yaw/roll はそこから逆算する。
-% ラベルには（逆算前の）サンプリングしたクォータニオンをそのまま書き出す。
+% generate_random_test_database.m
+% generate_random_database.m と同一の手順でテスト用データベースを生成する。
+% train (generate_random_database.m, rng_seed=42, N=10000) とは
+% 別の乱数シードを使うことで、学習に使っていない姿勢のみで構成された
+% ホールドアウトのテストセットにする。
 
 addpath(fileparts(mfilename('fullpath')));  % initBoxSim, renderBoxImage
 
 %% 設定
-N            = 10000;       % サンプル数
-rng_seed     = 42;
+N            = 2000;        % サンプル数
+rng_seed     = 999;         % train (42) とは異なるシード
 
 cam_params.imageSize = 512;
 cam_params.fov       = 25;
-target_size          = [3, 2, 1];  % [幅, 高さ, 奥行] (m)
+target_size          = [3, 2, 1];  % [幅, 高さ, 奥行] (m)  train と同一
 ref_distance         = 10;
 
-save_dir  = 'database_random';
+save_dir  = 'database_random_test';
 image_dir = fullfile(save_dir, 'images');
 
 %% 出力先作成
@@ -48,9 +43,9 @@ csv_path = fullfile(save_dir, 'labels.csv');
 fid = fopen(csv_path, 'w');
 fprintf(fid, 'image,qw,qx,qy,qz\n');
 
-bin_threshold = 5;  % これより明るい画素を前景(255)とみなす
+bin_threshold = 5;  % これより明るい画素を前景(255)とみなす（train と同一）
 
-fprintf('=== ランダムデータベース生成 (%d枚) ===\n', N);
+fprintf('=== テストデータベース生成 (%d枚) ===\n', N);
 tic;
 
 for i = 1:N
