@@ -32,13 +32,29 @@ from silhouette_pose.model import SilhouettePoseNet
 def setup_japanese_font() -> None:
     """matplotlib のグラフ内日本語が □ 化けするのを防ぐフォント設定。
 
-    japanize_matplotlib があればそれを使い (Colab で apt/フォント個別インストール
-    不要)、なければ OS にプリインストールされた日本語フォントを探して使う。
+    1. japanize_matplotlib があればそれを使う。
+    2. なければ pip で自動インストールを試みる (Colab はプリインストール
+       済みの日本語フォントを持たないことが多く、フォント名探索だけでは
+       □ 化けが直らないため)。
+    3. それでも失敗したら OS にプリインストールされた日本語フォントを探す。
     """
     try:
         import japanize_matplotlib  # noqa: F401
         return
     except ImportError:
+        pass
+
+    try:
+        import subprocess
+        import sys
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-q", "japanize-matplotlib"],
+            check=True,
+        )
+        import japanize_matplotlib  # noqa: F401
+        print("[情報] japanize-matplotlib を自動インストールしました。")
+        return
+    except Exception:
         pass
 
     candidates = [
@@ -54,8 +70,8 @@ def setup_japanese_font() -> None:
             return
 
     print(
-        "[警告] 日本語フォントが見つかりませんでした。グラフの日本語が □ になる場合は "
-        "`pip install japanize-matplotlib` を実行してから再実行してください。"
+        "[警告] 日本語フォントの自動設定に失敗しました。グラフの日本語が □ になる場合は "
+        "`pip install japanize-matplotlib` を手動で実行してから再実行してください。"
     )
 
 
@@ -76,7 +92,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-samples",   type=int, default=16, help="グリッド表示サンプル数")
     p.add_argument("--seed",        type=int, default=0)
     p.add_argument("--out-dir",     default="eval_output")
-    p.add_argument("--err-threshold", type=float, default=45.0,
+    p.add_argument("--err-threshold", type=float, default=5.0,
                     help="誤答サンプル一覧に含める角度誤差のしきい値 [deg]")
     p.add_argument("--hist-zoom-min", type=float, default=1.0,
                     help="ヒストグラムのズーム版で表示する角度誤差の下限 [deg] "
@@ -296,6 +312,43 @@ def _quat_mul_np(q: np.ndarray, r: np.ndarray) -> np.ndarray:
     ], dtype=np.float32)
 
 
+def save_zoom_histogram(
+    errors_arr: np.ndarray,
+    threshold: float,
+    out_dir: Path,
+    filename: str,
+) -> None:
+    """threshold [deg] を超える誤差だけを抜き出したヒストグラムを保存する。
+
+    低誤差にサンプルが集中していると全体ヒストグラムでは外れ値側の分布が
+    潰れて見えなくなるため、しきい値以上のサブセットだけを別スケールで描画する。
+    """
+    zoomed = errors_arr[errors_arr > threshold]
+    if len(zoomed) == 0:
+        print(f"\n{threshold:.0f}° を超えるサンプルはありませんでした({filename} はスキップ)。")
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.hist(zoomed, bins=90, color="steelblue", edgecolor="white", linewidth=0.3)
+    ax.axvline(zoomed.mean(), color="tomato", linewidth=1.5,
+               label=f"平均 {zoomed.mean():.1f}°")
+    ax.axvline(np.median(zoomed), color="orange", linewidth=1.5, linestyle="--",
+               label=f"中央値 {np.median(zoomed):.1f}°")
+    ax.set_xlabel("角度誤差 (°)")
+    ax.set_ylabel("サンプル数")
+    ax.set_title(
+        f"角度誤差の分布 (> {threshold:.0f}°, "
+        f"{len(zoomed)}/{len(errors_arr)}件 = "
+        f"{100*len(zoomed)/len(errors_arr):.1f}%)"
+    )
+    ax.legend()
+    fig.tight_layout()
+    path = out_dir / filename
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+    print(f"保存: {path}")
+
+
 # ---------------------------------------------------------------------------
 # メイン
 # ---------------------------------------------------------------------------
@@ -386,35 +439,14 @@ def main() -> None:
     print(f"\n保存: {hist_path}")
 
     # -----------------------------------------------------------------------
-    # 図1b: 角度誤差ヒストグラム (ズーム版)
+    # 図1b/1c: 角度誤差ヒストグラム (ズーム版)
     # 低誤差 (0〜1°付近) にサンプルが集中していると、そこ以外のビンが
     # 潰れて見えなくなるため、しきい値より大きい誤差だけを抜き出して
-    # 別スケールで表示する。
+    # 別スケールで表示する。--hist-zoom-min (既定1°) と --err-threshold
+    # (既定5°、図4の誤答サンプルと同じ基準) の2段階で出力する。
     # -----------------------------------------------------------------------
-    zoom_min = args.hist_zoom_min
-    zoomed_errors = all_errors_arr[all_errors_arr > zoom_min]
-    if len(zoomed_errors) > 0:
-        fig, ax = plt.subplots(figsize=(8, 4))
-        ax.hist(zoomed_errors, bins=90, color="steelblue", edgecolor="white", linewidth=0.3)
-        ax.axvline(zoomed_errors.mean(), color="tomato", linewidth=1.5,
-                   label=f"平均 {zoomed_errors.mean():.1f}°")
-        ax.axvline(np.median(zoomed_errors), color="orange", linewidth=1.5, linestyle="--",
-                   label=f"中央値 {np.median(zoomed_errors):.1f}°")
-        ax.set_xlabel("角度誤差 (°)")
-        ax.set_ylabel("サンプル数")
-        ax.set_title(
-            f"角度誤差の分布 (> {zoom_min:.0f}°, "
-            f"{len(zoomed_errors)}/{len(all_errors_arr)}件 = "
-            f"{100*len(zoomed_errors)/len(all_errors_arr):.1f}%)"
-        )
-        ax.legend()
-        fig.tight_layout()
-        hist_zoom_path = out_dir / "error_histogram_zoom.png"
-        fig.savefig(hist_zoom_path, dpi=120)
-        plt.close(fig)
-        print(f"保存: {hist_zoom_path}")
-    else:
-        print(f"\n{zoom_min:.0f}° を超えるサンプルはありませんでした(ズーム版ヒストグラムはスキップ)。")
+    save_zoom_histogram(all_errors_arr, args.hist_zoom_min, out_dir, "error_histogram_zoom.png")
+    save_zoom_histogram(all_errors_arr, args.err_threshold, out_dir, "error_histogram_zoom_5deg.png")
 
     # -----------------------------------------------------------------------
     # 図2: ランダムサンプルグリッド
