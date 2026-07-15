@@ -284,7 +284,9 @@ def project_box_edges(
     v[:, 2] += distance
 
     tan_half = math.tan(math.radians(fov_deg) / 2.0)
-    ndc_x = v[:, 0] / (v[:, 2] * tan_half)
+    # MATLAB (CameraPosition=[0,0,0], CameraTarget=[0,0,1], CameraUpVector=[0,1,0])
+    # のカメラは world +X が画面左方向になるため、符号を反転して合わせる。
+    ndc_x = -v[:, 0] / (v[:, 2] * tan_half)
     ndc_y = v[:, 1] / (v[:, 2] * tan_half)
     px = (ndc_x + 1.0) / 2.0 * img_w
     py = (1.0 - (ndc_y + 1.0) / 2.0) * img_h
