@@ -11,6 +11,7 @@ import argparse
 import csv
 import math
 import random
+import time
 from pathlib import Path
 
 import matplotlib
@@ -388,6 +389,7 @@ def main() -> None:
     all_errors: list[float] = []
     all_pred_quats: dict[str, np.ndarray] = {}
 
+    infer_start = time.perf_counter()
     batch_size = 128
     for start in range(0, len(all_keys), batch_size):
         batch_keys = all_keys[start:start + batch_size]
@@ -410,6 +412,14 @@ def main() -> None:
         for k, p, e in zip(valid_keys, pred.cpu().numpy(), errors):
             all_errors.append(float(e))
             all_pred_quats[k] = p
+
+    infer_elapsed = time.perf_counter() - infer_start
+    n_infer = len(all_errors)
+    print(
+        f"推論時間: {infer_elapsed:.1f}秒 "
+        f"({n_infer}枚, {n_infer/infer_elapsed:.1f}枚/秒, "
+        f"{1000*infer_elapsed/n_infer:.1f}ms/枚)"
+    )
 
     all_errors_arr = np.array(all_errors)
     print(f"\n=== 角度誤差統計 ===")
