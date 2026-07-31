@@ -88,9 +88,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gate-mode", choices=["chi2", "fixed", "both", "none"], default="both")
     p.add_argument("--gate-chi2-threshold", type=float, default=7.815)
     p.add_argument("--gate-max-angle-deg", type=float, default=30.0)
-    p.add_argument("--omega0", default="0,0,0", help="EKF の初期角速度推定値 wx,wy,wz [rad/s]")
+    p.add_argument("--omega0", default=None,
+                    help="EKF の初期角速度推定値 wx,wy,wz [rad/s] (未指定なら最初の2フレームの"
+                         "NN観測から有限差分で自動推定する)")
     p.add_argument("--p0-theta", type=float, default=0.5, help="初期共分散 (姿勢, 対角成分)")
-    p.add_argument("--p0-omega", type=float, default=1.0, help="初期共分散 (角速度, 対角成分)")
+    p.add_argument("--p0-omega", type=float, default=2.0,
+                    help="初期共分散 (角速度, 対角成分)。ω0 を自動推定する場合、"
+                         "手動指定より不確実性が高いため既定値を大きめにしている")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--compare-euler", action="store_true",
                     help="--process-model の他にもう一方のモデルも走らせ、"
@@ -236,6 +240,20 @@ def detect_flip_window(
     return float(times[flip_indices[0]])
 
 
+def estimate_initial_omega(pred_quats: np.ndarray, times: np.ndarray) -> np.ndarray:
+    """最初の2フレームの NN 観測から、有限差分で初期角速度を概算する (body frame)。
+
+    真の初期角速度は実運用では分からない (箱を放り投げるたびランダム) ので、
+    EKF の外から真値を教えるのではなく観測だけから求める。これをしないと
+    ω0=0 のコールドスタートになり、速い回転の軌道で発散するリスクがある。
+    """
+    dt0 = times[1] - times[0]
+    rel = quat_mul(quat_conjugate(pred_quats[0]), pred_quats[1])
+    if rel[0] < 0:
+        rel = -rel
+    return rotvec_from_quat(rel) / dt0
+
+
 def main() -> None:
     args = parse_args()
     device = choose_device(args.device)
@@ -282,6 +300,12 @@ def main() -> None:
     # -----------------------------------------------------------------------
     # ② 時系列順に EKF を1ステップずつ適用 (--process-model で指定した方が主系列)
     # -----------------------------------------------------------------------
+    if args.omega0 is None:
+        times_for_omega0 = np.array([r["t"] for r in rows])
+        omega0_auto = estimate_initial_omega(pred_quats, times_for_omega0)
+        args.omega0 = ",".join(str(v) for v in omega0_auto)
+        print(f"ω0 を最初の2フレームから自動推定しました: {omega0_auto}")
+
     print(f"EKF 適用中 (process_model={args.process_model})...")
     primary = run_ekf_pass(rows, pred_quats, args.process_model, box_size, args)
     ekf_quats = primary["ekf_quats"]

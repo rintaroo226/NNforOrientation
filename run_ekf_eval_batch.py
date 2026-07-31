@@ -25,10 +25,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from quat_np import quat_conjugate, quat_mul, rotvec_from_quat, symmetry_aware_angle_error_deg
+from quat_np import symmetry_aware_angle_error_deg
 from run_ekf_eval import (
     choose_device,
     detect_flip_window,
+    estimate_initial_omega,
     load_image_tensor,
     load_trajectory_csv,
     run_ekf_pass,
@@ -57,20 +58,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--p0-omega", type=float, default=2.0,
                     help="ω0 を最初の2フレームから概算するため、手動指定より不確実性を高めに取る")
     return p.parse_args()
-
-
-def estimate_initial_omega(pred_quats: np.ndarray, times: np.ndarray) -> np.ndarray:
-    """最初の2フレームの NN 観測から、有限差分で初期角速度を概算する (body frame)。
-
-    真の初期角速度は実運用では分からない (各軌道でランダム) ので、EKF の外から
-    真値を教えるのではなく、観測だけから求める。これをしないと ω0=0 のコールド
-    スタートになり、速い回転の軌道で発散して統計がその発散に支配されてしまう。
-    """
-    dt0 = times[1] - times[0]
-    rel = quat_mul(quat_conjugate(pred_quats[0]), pred_quats[1])
-    if rel[0] < 0:
-        rel = -rel
-    return rotvec_from_quat(rel) / dt0
 
 
 def run_one_trajectory(
