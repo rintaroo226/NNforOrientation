@@ -15,7 +15,7 @@
 addpath(fileparts(mfilename('fullpath')));  % initBoxSim, renderBoxImage
 
 %% 設定
-N            = 10000;       % サンプル数 (train と同一)
+N            = 100000;      % サンプル数 (距離混在モデルの精度が良かったため10倍に拡大)
 rng_seed     = 43;          % train(42)/test(999)/distance_sweep(777)とは異なるシード
 
 cam_params.imageSize = 512;
