@@ -3,11 +3,15 @@ matlab/render_trajectory_with_distance.m の出力) に対して、bboxクロッ
 の NN 推論 + EKF を一気通貫で走らせ、「遠方でノイジーな生の観測を EKF の
 剛体力学モデルが平滑化できているか」を確認するスクリプト。
 
-run_ekf_eval.py との違いは実質2点だけ:
+run_ekf_eval.py との違いは実質3点:
   1. 画像の前処理が「そのままリサイズ」ではなく bboxcrop_dataset.bbox_crop_resize
      (train_bboxcrop.py で学習したモデルの入力と合わせるため)。
   2. labels.csv の distance 列を読み、誤差の時系列プロットに第2軸として
      重ねる (遠→近の遷移と誤差減少が対応しているかを目で見えるようにする)。
+  3. distance_from_bbox.estimate_distance で、クロップ前のbboxサイズ+推定
+     クォータニオンから距離自体も逆算し、GT distanceとの誤差を出す
+     (生のNN推定由来 / EKF事後推定由来の両方で比較し、EKFで姿勢が滑らかに
+     なることが距離推定の精度向上にも波及するかを確認する)。
 EKF 自体のロジック (run_ekf_pass) は run_ekf_eval.py と完全に同一 — EKF は
 クォータニオン観測しか見ておらず distance を一切必要としないため、変更不要。
 このプロジェクトの規約 (既存ファイルを改造するより新規ファイルを作り、
@@ -34,7 +38,8 @@ import numpy as np
 import torch
 from PIL import Image
 
-from bboxcrop_dataset import bbox_crop_resize
+from bboxcrop_dataset import bbox_crop_resize, tight_bbox
+from distance_from_bbox import estimate_distance
 from ekf import BoxOrientationEKF, EKFConfig
 from quat_np import quat_conjugate, quat_mul, rotvec_from_quat, symmetry_aware_angle_error_deg
 from rigid_body import principal_inertia
@@ -123,15 +128,22 @@ def choose_device(name: str) -> torch.device:
     return torch.device("cpu")
 
 
-def load_image_tensor_bboxcrop(image_path: Path, image_size: int, padding_factor: float) -> torch.Tensor:
-    """run_ekf_eval.load_image_tensor との唯一の差分: 全体リサイズではなく
-    bbox_crop_resize (train_bboxcrop.py が学習時に使ったのと同じ前処理)。
-    これが無いと、遠方フレームでは箱が画面の数%しか占めず、学習分布 (常に
-    bboxで正規化された見かけの大きさ) と大きく食い違ってしまう。
+def load_and_measure_bboxcrop(
+    image_path: Path, image_size: int, padding_factor: float,
+) -> tuple[torch.Tensor, float, bool]:
+    """bboxクロップ後のモデル入力テンソルに加えて、クロップ前(元画像)での
+    bboxピクセルサイズと、それがフレーム端に接しているか(クリッピング疑い)
+    も一緒に返す。後者2つは distance_from_bbox.estimate_distance で距離を
+    逆算するために使う (bboxクロップ自体はモデル入力にのみ必要)。
     """
     arr = np.asarray(Image.open(image_path).convert("L"), dtype=np.uint8)
+    x0, y0, x1, y1 = tight_bbox(arr)
+    bbox_px = float(max(x1 - x0, y1 - y0))
+    h, w = arr.shape
+    touches_border = (x0 == 0) or (x1 == w) or (y0 == 0) or (y1 == h)
     cropped = bbox_crop_resize(arr, image_size, padding_factor)
-    return torch.from_numpy(cropped).unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+    tensor = torch.from_numpy(cropped).unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+    return tensor, bbox_px, touches_border
 
 
 def load_trajectory_csv(path: Path) -> list[dict]:
@@ -262,17 +274,25 @@ def main() -> None:
     print("推論中 (bboxクロップ適用)...")
     infer_start = time.perf_counter()
     pred_quats = np.zeros((n, 4), dtype=np.float32)
+    bbox_px = np.zeros(n, dtype=np.float64)
+    touches_border = np.zeros(n, dtype=bool)
     batch_size = 128
     for start in range(0, n, batch_size):
         batch = rows[start:start + batch_size]
-        imgs = [load_image_tensor_bboxcrop(root / r["image"], image_size, padding_factor)
-                for r in batch]
+        measured = [load_and_measure_bboxcrop(root / r["image"], image_size, padding_factor)
+                    for r in batch]
+        imgs = [m[0] for m in measured]
+        bbox_px[start:start + len(batch)] = [m[1] for m in measured]
+        touches_border[start:start + len(batch)] = [m[2] for m in measured]
         x = torch.cat(imgs, dim=0).to(device)
         with torch.no_grad():
             pred = model(x)
         pred_quats[start:start + len(batch)] = pred.cpu().numpy()
     infer_elapsed = time.perf_counter() - infer_start
     print(f"推論時間: {infer_elapsed:.1f}秒 ({n}枚, {n/infer_elapsed:.1f}枚/秒)")
+    if touches_border.any():
+        print(f"[警告] {int(touches_border.sum())}/{n}フレームで箱がフレーム端に接しています"
+              f"(距離推定が過大評価になる可能性、距離逆算の結果からは除外します)")
 
     raw_err = np.full(n, np.nan)
     if has_gt:
@@ -297,6 +317,23 @@ def main() -> None:
     sym_branch_idx = result["sym_branch_idx"]
 
     # -----------------------------------------------------------------------
+    # ③ bboxサイズ+推定クォータニオンから距離を逆算 (生のNN推定 / EKF事後推定の両方)
+    # -----------------------------------------------------------------------
+    dist_est_raw = np.array([
+        estimate_distance(pred_quats[k], bbox_px[k], box_size) for k in range(n)
+    ])
+    dist_est_ekf = np.array([
+        estimate_distance(ekf_quats[k], bbox_px[k], box_size) for k in range(n)
+    ])
+    dist_err_raw_pct = np.full(n, np.nan)
+    dist_err_ekf_pct = np.full(n, np.nan)
+    if has_distance:
+        gt_distance = np.array([r["distance"] for r in rows])
+        valid = ~touches_border  # フレーム端で切れている画像は距離推定の評価から除外
+        dist_err_raw_pct[valid] = np.abs(dist_est_raw[valid] - gt_distance[valid]) / gt_distance[valid] * 100
+        dist_err_ekf_pct[valid] = np.abs(dist_est_ekf[valid] - gt_distance[valid]) / gt_distance[valid] * 100
+
+    # -----------------------------------------------------------------------
     # 出力: CSV
     # -----------------------------------------------------------------------
     trace_path = out_dir / "ekf_trace.csv"
@@ -306,9 +343,10 @@ def main() -> None:
             "t", "raw_err_deg", "ekf_err_deg", "accepted", "nis", "sym_branch_idx",
             "pred_qw", "pred_qx", "pred_qy", "pred_qz",
             "ekf_qw", "ekf_qx", "ekf_qy", "ekf_qz",
+            "bbox_px", "bbox_touches_border", "dist_est_raw", "dist_est_ekf",
         ]
         if has_distance:
-            header.append("distance")
+            header += ["distance", "dist_err_raw_pct", "dist_err_ekf_pct"]
         writer.writerow(header)
         for k in range(n):
             row = [
@@ -320,9 +358,15 @@ def main() -> None:
                 sym_branch_idx[k],
                 *[f"{v:.8f}" for v in pred_quats[k]],
                 *[f"{v:.8f}" for v in ekf_quats[k]],
+                f"{bbox_px[k]:.2f}", int(touches_border[k]),
+                f"{dist_est_raw[k]:.4f}", f"{dist_est_ekf[k]:.4f}",
             ]
             if has_distance:
-                row.append(f"{rows[k]['distance']:.4f}")
+                row += [
+                    f"{rows[k]['distance']:.4f}",
+                    "" if math.isnan(dist_err_raw_pct[k]) else f"{dist_err_raw_pct[k]:.4f}",
+                    "" if math.isnan(dist_err_ekf_pct[k]) else f"{dist_err_ekf_pct[k]:.4f}",
+                ]
             writer.writerow(row)
     print(f"保存: {trace_path}")
 
@@ -378,6 +422,38 @@ def main() -> None:
                           f"EKF平均={np.nanmean(ekf_err[mask]):.2f}°  "
                           f"生の標準偏差={np.nanstd(raw_err[mask]):.2f}°  "
                           f"EKF標準偏差={np.nanstd(ekf_err[mask]):.2f}°")
+
+            # -----------------------------------------------------------------
+            # 出力: 距離推定 (bboxサイズ+推定クォータニオンから逆算) の精度
+            # -----------------------------------------------------------------
+            fig2, (axd1, axd2) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+            axd1.plot(t, distances, label="GT距離", color="black", linewidth=1.5)
+            axd1.plot(t, dist_est_raw, label="距離推定 (生のNN由来)", color="steelblue", alpha=0.7)
+            axd1.plot(t, dist_est_ekf, label="距離推定 (EKF事後由来)", color="tomato", linewidth=1.3)
+            if touches_border.any():
+                axd1.scatter(t[touches_border], distances[touches_border], color="black", marker="x",
+                              s=25, label="フレーム端接触(逆算対象外)", zorder=5)
+            axd1.set_ylabel("距離 [m]")
+            axd1.set_title("bboxサイズ+推定姿勢からの距離逆算")
+            axd1.legend(fontsize=8)
+
+            axd2.plot(t, dist_err_raw_pct, label="距離誤差% (生のNN由来)", color="steelblue", alpha=0.7)
+            axd2.plot(t, dist_err_ekf_pct, label="距離誤差% (EKF事後由来)", color="tomato", linewidth=1.3)
+            axd2.set_xlabel("時刻 [s]")
+            axd2.set_ylabel("距離誤差 [%]")
+            axd2.legend(fontsize=8)
+
+            fig2.tight_layout()
+            dist_plot_path = out_dir / "distance_estimation.png"
+            fig2.savefig(dist_plot_path, dpi=120)
+            plt.close(fig2)
+            print(f"保存: {dist_plot_path}")
+
+            print("\n=== 距離推定サマリ (フレーム端接触フレームは除外) ===")
+            print(f"  生のNN由来   平均誤差: {np.nanmean(dist_err_raw_pct):.2f}%  "
+                  f"中央値: {np.nanmedian(dist_err_raw_pct):.2f}%")
+            print(f"  EKF事後由来  平均誤差: {np.nanmean(dist_err_ekf_pct):.2f}%  "
+                  f"中央値: {np.nanmedian(dist_err_ekf_pct):.2f}%")
     else:
         print("\nGT が無いため誤差プロット/サマリはスキップします。")
 
