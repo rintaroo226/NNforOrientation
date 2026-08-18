@@ -11,11 +11,16 @@ SilhouettePoseBBoxCropDataset (前景bboxを一定の余白付きで切り出し
 をそのまま使う。bboxクロップ後の見え方は元の距離に依存しなくなるため、
 複数距離で再レンダリングし直す必要は無い、という想定に基づく。
 
-解像度劣化augmentationは、データセットのサイズ(=1epochあたりのbatch数、
-学習時間)を変えないよう、サンプル数を増やすのではなく、既存のサンプルに
-確率的(既定50%)に劣化を掛ける方式にしている(SilhouettePoseBBoxCropDataset
-の augment_prob)。epochを重ねる中で、同じ姿勢でも綺麗な版と劣化した版の
-両方に触れる。
+解像度劣化augmentationは、「綺麗な版」と「劣化させた版」を別々のサンプルとして
+データセットに追加する(ConcatDataset、学習データは実質2倍になる)。同じ元姿勢の
+綺麗版/劣化版が学習用・検証用に分かれてリークしないよう、姿勢のインデックス単位で
+先に train/val を分割してから両方に適用する。検証データは常に綺麗な版のみを使う
+(augmentationをかけるとbest_angleの比較がepochごとにブレるため)。
+
+1epochあたりの処理量(=データセットのサイズそのもの、batch_sizeには依らない)は
+augmentation有効時に2倍になるため、総計算量(≒学習時間、epoch数×学習データ枚数)を
+augmentation無しのベースラインと揃えたい場合は --epochs をベースラインの半分にする
+(batch_sizeを変えても総計算量は変わらないので、そちらでは調整できない)。
 
 train.py は変更せず、このスクリプトとして独立に用意する。チェックポイントも
 既定で train.py とは別名(checkpoints/silhouette_pose_bboxcrop.pt)に保存する。
@@ -31,7 +36,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import ConcatDataset, DataLoader, Subset
 
 from bboxcrop_dataset import SilhouettePoseBBoxCropDataset
 from silhouette_pose.losses import (
@@ -55,10 +60,10 @@ def parse_args() -> argparse.Namespace:
                               "サンプルを追加すること)を無効化する")
     parser.add_argument("--augment-min-scale", type=float, default=0.15,
                          help="解像度劣化augmentationで許容する最小の縮小率")
-    parser.add_argument("--augment-prob", type=float, default=0.5,
-                         help="各サンプルに解像度劣化augmentationを掛ける確率")
     parser.set_defaults(augment_resolution=True)
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=50,
+                         help="augmentation有効時はデータが2倍になるため、他条件と"
+                              "総計算量(≒学習時間)を揃えたい場合はこの値を半分にする")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--val-ratio", type=float, default=0.2)
@@ -111,8 +116,6 @@ def main() -> None:
     set_seed(args.seed)
     device = choose_device(args.device)
 
-    # 検証データは常に綺麗な版で固定する(augmentationをかけると評価ごとに
-    # ランダムにブレて best_angle の比較が不安定になるため)
     clean_dataset = SilhouettePoseBBoxCropDataset(
         root=args.data_root,
         labels_csv=args.labels_csv,
@@ -122,30 +125,42 @@ def main() -> None:
     )
     n_samples = len(clean_dataset)
     val_size = max(1, int(n_samples * args.val_ratio))
-    train_size = n_samples - val_size
+
+    # 姿勢インデックス単位で先にtrain/valを分割する(綺麗版/劣化版が
+    # 別々に学習用・検証用へ漏れてリークするのを防ぐため)
+    perm = torch.randperm(n_samples, generator=torch.Generator().manual_seed(args.seed)).tolist()
+    val_indices = perm[:val_size]
+    train_indices = perm[val_size:]
 
     if args.augment_resolution:
-        train_dataset = SilhouettePoseBBoxCropDataset(
+        degraded_dataset = SilhouettePoseBBoxCropDataset(
             root=args.data_root,
             labels_csv=args.labels_csv,
             image_size=args.image_size,
             padding_factor=args.padding_factor,
             augment_resolution=True,
             augment_min_scale=args.augment_min_scale,
-            augment_prob=args.augment_prob,
         )
+        train_set = ConcatDataset([
+            Subset(clean_dataset, train_indices),
+            Subset(degraded_dataset, train_indices),
+        ])
+        # 検証データは常に綺麗な版のみ(augmentationをかけるとepochごとに
+        # best_angleの比較がブレるため)
+        val_set = Subset(clean_dataset, val_indices)
     else:
-        train_dataset = clean_dataset
+        train_set = Subset(clean_dataset, train_indices)
+        val_set = Subset(clean_dataset, val_indices)
 
-    generator = torch.Generator().manual_seed(args.seed)
-    train_split, _ = random_split(train_dataset, [train_size, val_size], generator=generator)
-    generator = torch.Generator().manual_seed(args.seed)
-    _, val_split = random_split(clean_dataset, [train_size, val_size], generator=generator)
-    train_set, val_set = train_split, val_split
-
-    print(f"学習データ: {len(train_set)}枚"
-          f"{f' (augmentation確率{args.augment_prob:.0%})' if args.augment_resolution else ''}"
-          f"  検証データ: {len(val_set)}枚(常に綺麗な版)")
+    # 総計算量の目安 = epoch数 x 1epochあたりの学習サンプル数。batch_sizeは
+    # 総計算量に影響しない(batchの切り方が変わるだけ)ので調整しない。
+    # augmentation有りだとデータが2倍になるため、ベースラインと計算時間を
+    # 揃えたいなら --epochs をベースラインの半分にする。
+    total_sample_passes = args.epochs * len(train_set)
+    print(f"学習データ: {len(train_set)}枚  検証データ: {len(val_set)}枚  "
+          f"batch_size: {args.batch_size}")
+    print(f"総計算量の目安(epoch数 x 学習データ枚数): {total_sample_passes:,}  "
+          f"(他条件と計算時間を揃えたい場合はこの値が一致するようepoch数を調整してください)")
 
     train_loader = DataLoader(
         train_set,
@@ -218,7 +233,6 @@ def main() -> None:
                     "padding_factor": args.padding_factor,
                     "augment_resolution": args.augment_resolution,
                     "augment_min_scale": args.augment_min_scale,
-                    "augment_prob": args.augment_prob,
                     "best_angle_deg": best_angle,
                 },
                 output,

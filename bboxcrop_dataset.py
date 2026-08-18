@@ -100,7 +100,6 @@ class SilhouettePoseBBoxCropDataset(Dataset):
         padding_factor: float = 1.25,
         augment_resolution: bool = False,
         augment_min_scale: float = 0.15,
-        augment_prob: float = 0.5,
     ) -> None:
         self.root = Path(root)
         self.labels_csv = Path(labels_csv)
@@ -108,7 +107,6 @@ class SilhouettePoseBBoxCropDataset(Dataset):
         self.padding_factor = padding_factor
         self.augment_resolution = augment_resolution
         self.augment_min_scale = augment_min_scale
-        self.augment_prob = augment_prob
         self.samples = self._read_labels()
 
     def _read_labels(self) -> list[tuple[str, np.ndarray]]:
@@ -138,7 +136,7 @@ class SilhouettePoseBBoxCropDataset(Dataset):
         image_path = self.root / rel_path
         arr = np.asarray(Image.open(image_path).convert("L"), dtype=np.uint8)
         cropped = bbox_crop_resize(arr, self.image_size, self.padding_factor)
-        if self.augment_resolution and np.random.random() < self.augment_prob:
+        if self.augment_resolution:
             cropped = degrade_resolution(cropped, self.image_size, self.augment_min_scale)
         x = torch.from_numpy(cropped).unsqueeze(0)
         y = torch.from_numpy(quat)
