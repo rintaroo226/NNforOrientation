@@ -1,27 +1,22 @@
-"""既存の distance=10 レンダリング画像に bbox クロップ前処理を追加した Dataset。
+"""bbox クロップ前処理(距離不変な正規化)の中核となる純粋関数群。
 
-train.py が使う SilhouettePoseDataset (silhouette_pose/dataset.py) は画像全体を
-そのままリサイズするため、対象までの距離が学習時(distance=10)と変わると
-画面内での見かけの大きさが変わり、精度が大きく落ちることが
-eval_distance_sweep.py で確認された。
+対象までの距離が変わると画面内での見かけの大きさが変わり、姿勢推定精度が
+大きく落ちることが eval_distance_sweep.py で確認された。ここでは前景の
+外接矩形(bbox)を一定の余白付きで切り出してから正方形にリサイズすることで、
+「対象がフレームに占める割合」を常に一定にする(距離不変な正規化)。
 
-この Dataset は、前景の外接矩形(bbox)を一定の余白付きで切り出してから
-正方形にリサイズする。この正規化を学習時から使うことで、距離が変わって
-対象の見かけの大きさが変わっても「対象がフレームに占める割合」は常に
-一定になり、将来 別の距離で撮った画像でも同じ前処理をかければ姿勢推定できる
-はず、という考え方に基づく。学習データ自体は distance=10 の既存レンダリング
-(matlab/database_random 等)をそのまま使い、複数距離での再レンダリングは行わない。
+この処理は決定論的(degrade_resolutionのみランダム性あり)なので、学習の
+Dataset の __getitem__ 内で毎epochやり直すのではなく、
+preprocess_bboxcrop_dataset.py でオフライン(学習前に1回だけ)に適用し、
+結果を新しい画像ファイルとして保存する方式にしている。学習側は生成済みの
+画像を silhouette_pose.dataset.SilhouettePoseDataset でそのまま読むだけでよく、
+このモジュールに依存しない。
 
-silhouette_pose/dataset.py は変更せず、この用途専用の新しい Dataset として
-独立に実装する。
+eval_distance_sweep_bboxcrop.py 等、推論時に(保存済みでない)新しい画像へ
+その場でクロップを適用する必要がある箇所からはこの関数群を直接importする。
 """
-import csv
-from pathlib import Path
-
 import numpy as np
-import torch
 from PIL import Image
-from torch.utils.data import Dataset
 
 
 def tight_bbox(arr: np.ndarray) -> tuple[int, int, int, int]:
@@ -82,62 +77,3 @@ def degrade_resolution(arr01: np.ndarray, image_size: int, min_scale: float = 0.
     img = img.resize((small_size, small_size), Image.Resampling.BILINEAR)
     img = img.resize((image_size, image_size), Image.Resampling.BILINEAR)
     return np.asarray(img, dtype=np.float32) / 255.0
-
-
-class SilhouettePoseBBoxCropDataset(Dataset):
-    """SilhouettePoseDataset(silhouette_pose/dataset.py)のbboxクロップ版。
-
-    CSV format:
-        image,qw,qx,qy,qz
-        silhouettes/sample_000001.png,0.98,0.01,0.02,0.19
-    """
-
-    def __init__(
-        self,
-        root: str | Path,
-        labels_csv: str | Path,
-        image_size: int = 64,
-        padding_factor: float = 1.25,
-        augment_resolution: bool = False,
-        augment_min_scale: float = 0.15,
-    ) -> None:
-        self.root = Path(root)
-        self.labels_csv = Path(labels_csv)
-        self.image_size = image_size
-        self.padding_factor = padding_factor
-        self.augment_resolution = augment_resolution
-        self.augment_min_scale = augment_min_scale
-        self.samples = self._read_labels()
-
-    def _read_labels(self) -> list[tuple[str, np.ndarray]]:
-        samples: list[tuple[str, np.ndarray]] = []
-        with self.labels_csv.open(newline="") as f:
-            reader = csv.DictReader(f)
-            required = {"image", "qw", "qx", "qy", "qz"}
-            missing = required.difference(reader.fieldnames or [])
-            if missing:
-                raise ValueError(f"labels CSV is missing columns: {sorted(missing)}")
-            for row in reader:
-                quat = np.array(
-                    [row["qw"], row["qx"], row["qy"], row["qz"]],
-                    dtype=np.float32,
-                )
-                quat /= max(float(np.linalg.norm(quat)), 1e-8)
-                samples.append((row["image"], quat))
-        if not samples:
-            raise ValueError(f"no samples found in {self.labels_csv}")
-        return samples
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
-        rel_path, quat = self.samples[index]
-        image_path = self.root / rel_path
-        arr = np.asarray(Image.open(image_path).convert("L"), dtype=np.uint8)
-        cropped = bbox_crop_resize(arr, self.image_size, self.padding_factor)
-        if self.augment_resolution:
-            cropped = degrade_resolution(cropped, self.image_size, self.augment_min_scale)
-        x = torch.from_numpy(cropped).unsqueeze(0)
-        y = torch.from_numpy(quat)
-        return x, y

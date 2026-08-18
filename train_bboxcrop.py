@@ -2,33 +2,29 @@
 
 train.py が使う SilhouettePoseDataset は画像全体をそのままリサイズするため、
 対象までの距離が学習時(distance=10)と変わると精度が大きく落ちることが
-eval_distance_sweep.py で確認された。このスクリプトは bboxcrop_dataset.py の
-SilhouettePoseBBoxCropDataset (前景bboxを一定の余白付きで切り出してから
-正方形にリサイズする)を使って学習し、距離が変わっても姿勢推定できる
-モデルを目指す。
+eval_distance_sweep.py で確認された。bboxクロップ(前景の外接矩形を一定の
+余白付きで切り出してから正方形にリサイズする)で「対象がフレームに占める
+割合」を常に一定にすれば、距離が変わっても姿勢推定できるはず、という狙い。
 
-学習データ自体は distance=10 で描画された既存のもの(例: matlab/database_random)
-をそのまま使う。bboxクロップ後の見え方は元の距離に依存しなくなるため、
-複数距離で再レンダリングし直す必要は無い、という想定に基づく。
-
-解像度劣化augmentationは、「綺麗な版」と「劣化させた版」を別々のサンプルとして
-データセットに追加する(ConcatDataset、学習データは実質2倍になる)。同じ元姿勢の
-綺麗版/劣化版が学習用・検証用に分かれてリークしないよう、姿勢のインデックス単位で
-先に train/val を分割してから両方に適用する。検証データは常に綺麗な版のみを使う
-(augmentationをかけるとbest_angleの比較がepochごとにブレるため)。
-
-1epochあたりの処理量(=データセットのサイズそのもの、batch_sizeには依らない)は
-augmentation有効時に2倍になるため、総計算量(≒学習時間、epoch数×学習データ枚数)を
-augmentation無しのベースラインと揃えたい場合は --epochs をベースラインの半分にする
-(batch_sizeを変えても総計算量は変わらないので、そちらでは調整できない)。
+bboxクロップ自体(+解像度劣化augmentation)は決定論的な前処理なので、この
+スクリプトの中では行わない。事前に preprocess_bboxcrop_dataset.py で1回だけ
+適用し、新しい画像ファイル一式として保存しておいたものを、普通の
+SilhouettePoseDataset (silhouette_pose/dataset.py, 変更無し)でそのまま
+読み込む。学習コードは train.py とほぼ同じままにして、前処理は前処理側の
+責務として分離する。
 
 train.py は変更せず、このスクリプトとして独立に用意する。チェックポイントも
 既定で train.py とは別名(checkpoints/silhouette_pose_bboxcrop.pt)に保存する。
 
 使用例:
-    python train_bboxcrop.py \
+    python3 preprocess_bboxcrop_dataset.py \
         --data-root matlab/database_random \
-        --labels-csv matlab/database_random/labels.csv
+        --labels-csv matlab/database_random/labels.csv \
+        --out-dir database_random_bboxcrop \
+        --augment-resolution
+    python train_bboxcrop.py \
+        --data-root database_random_bboxcrop \
+        --labels-csv database_random_bboxcrop/labels.csv
 """
 import argparse
 import random
@@ -36,9 +32,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import ConcatDataset, DataLoader, Subset
+from torch.utils.data import DataLoader, random_split
 
-from bboxcrop_dataset import SilhouettePoseBBoxCropDataset
+from silhouette_pose.dataset import SilhouettePoseDataset
 from silhouette_pose.losses import (
     symmetry_aware_angle_error_deg,
     symmetry_aware_quaternion_loss,
@@ -48,22 +44,16 @@ from silhouette_pose.model import SilhouettePoseNet
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-root", required=True)
+    parser.add_argument("--data-root", required=True,
+                         help="preprocess_bboxcrop_dataset.py の --out-dir")
     parser.add_argument("--labels-csv", required=True)
     parser.add_argument("--output", default="checkpoints/silhouette_pose_bboxcrop.pt")
     parser.add_argument("--image-size", type=int, default=64)
     parser.add_argument("--padding-factor", type=float, default=1.25,
-                         help="前景bboxの外側に取る余白の倍率 (距離によらず一定にする正規化)")
-    parser.add_argument("--no-augment-resolution", dest="augment_resolution",
-                         action="store_false",
-                         help="解像度劣化augmentation(遠距離のガタガタしたエッジを模擬した"
-                              "サンプルを追加すること)を無効化する")
-    parser.add_argument("--augment-min-scale", type=float, default=0.15,
-                         help="解像度劣化augmentationで許容する最小の縮小率")
-    parser.set_defaults(augment_resolution=True)
-    parser.add_argument("--epochs", type=int, default=50,
-                         help="augmentation有効時はデータが2倍になるため、他条件と"
-                              "総計算量(≒学習時間)を揃えたい場合はこの値を半分にする")
+                         help="preprocess_bboxcrop_dataset.py で使った値と揃える"
+                              "(学習自体には使わず、チェックポイントに記録するだけ。"
+                              "推論時に同じクロップを再現するため)")
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--val-ratio", type=float, default=0.2)
@@ -116,51 +106,19 @@ def main() -> None:
     set_seed(args.seed)
     device = choose_device(args.device)
 
-    clean_dataset = SilhouettePoseBBoxCropDataset(
+    dataset = SilhouettePoseDataset(
         root=args.data_root,
         labels_csv=args.labels_csv,
         image_size=args.image_size,
-        padding_factor=args.padding_factor,
-        augment_resolution=False,
     )
-    n_samples = len(clean_dataset)
-    val_size = max(1, int(n_samples * args.val_ratio))
-
-    # 姿勢インデックス単位で先にtrain/valを分割する(綺麗版/劣化版が
-    # 別々に学習用・検証用へ漏れてリークするのを防ぐため)
-    perm = torch.randperm(n_samples, generator=torch.Generator().manual_seed(args.seed)).tolist()
-    val_indices = perm[:val_size]
-    train_indices = perm[val_size:]
-
-    if args.augment_resolution:
-        degraded_dataset = SilhouettePoseBBoxCropDataset(
-            root=args.data_root,
-            labels_csv=args.labels_csv,
-            image_size=args.image_size,
-            padding_factor=args.padding_factor,
-            augment_resolution=True,
-            augment_min_scale=args.augment_min_scale,
-        )
-        train_set = ConcatDataset([
-            Subset(clean_dataset, train_indices),
-            Subset(degraded_dataset, train_indices),
-        ])
-        # 検証データは常に綺麗な版のみ(augmentationをかけるとepochごとに
-        # best_angleの比較がブレるため)
-        val_set = Subset(clean_dataset, val_indices)
-    else:
-        train_set = Subset(clean_dataset, train_indices)
-        val_set = Subset(clean_dataset, val_indices)
-
-    # 総計算量の目安 = epoch数 x 1epochあたりの学習サンプル数。batch_sizeは
-    # 総計算量に影響しない(batchの切り方が変わるだけ)ので調整しない。
-    # augmentation有りだとデータが2倍になるため、ベースラインと計算時間を
-    # 揃えたいなら --epochs をベースラインの半分にする。
-    total_sample_passes = args.epochs * len(train_set)
-    print(f"学習データ: {len(train_set)}枚  検証データ: {len(val_set)}枚  "
-          f"batch_size: {args.batch_size}")
-    print(f"総計算量の目安(epoch数 x 学習データ枚数): {total_sample_passes:,}  "
-          f"(他条件と計算時間を揃えたい場合はこの値が一致するようepoch数を調整してください)")
+    val_size = max(1, int(len(dataset) * args.val_ratio))
+    train_size = len(dataset) - val_size
+    train_set, val_set = random_split(
+        dataset,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(args.seed),
+    )
+    print(f"学習データ: {len(train_set)}枚  検証データ: {len(val_set)}枚")
 
     train_loader = DataLoader(
         train_set,
@@ -231,8 +189,6 @@ def main() -> None:
                     "model": model.state_dict(),
                     "image_size": args.image_size,
                     "padding_factor": args.padding_factor,
-                    "augment_resolution": args.augment_resolution,
-                    "augment_min_scale": args.augment_min_scale,
                     "best_angle_deg": best_angle,
                 },
                 output,
