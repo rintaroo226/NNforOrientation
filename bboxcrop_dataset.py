@@ -67,6 +67,23 @@ def bbox_crop_resize(arr: np.ndarray, image_size: int, padding_factor: float) ->
     return np.asarray(img, dtype=np.float32) / 255.0
 
 
+def degrade_resolution(arr01: np.ndarray, image_size: int, min_scale: float = 0.15) -> np.ndarray:
+    """image_size の画像を一度ランダムに小さい解像度へダウンサンプルしてから
+    image_size に戻す (実効解像度がガタガタ/低解像度になる状況を模擬する)。
+
+    distance=10 固定で学習すると、bboxクロップ後も常に高い実効解像度の画像しか
+    見ないため、遠距離レンダリングで生じるガタガタしたエッジにNNが慣れておらず
+    精度が落ちることが distance sweep 評価と可視化で確認された。学習時にこの
+    augmentation を掛けることで、様々な実効解像度に対して頑健にする狙い。
+    """
+    scale = np.random.uniform(min_scale, 1.0)
+    small_size = max(int(round(image_size * scale)), 4)
+    img = Image.fromarray((arr01 * 255.0).astype(np.uint8))
+    img = img.resize((small_size, small_size), Image.Resampling.BILINEAR)
+    img = img.resize((image_size, image_size), Image.Resampling.BILINEAR)
+    return np.asarray(img, dtype=np.float32) / 255.0
+
+
 class SilhouettePoseBBoxCropDataset(Dataset):
     """SilhouettePoseDataset(silhouette_pose/dataset.py)のbboxクロップ版。
 
@@ -81,11 +98,15 @@ class SilhouettePoseBBoxCropDataset(Dataset):
         labels_csv: str | Path,
         image_size: int = 64,
         padding_factor: float = 1.25,
+        augment_resolution: bool = False,
+        augment_min_scale: float = 0.15,
     ) -> None:
         self.root = Path(root)
         self.labels_csv = Path(labels_csv)
         self.image_size = image_size
         self.padding_factor = padding_factor
+        self.augment_resolution = augment_resolution
+        self.augment_min_scale = augment_min_scale
         self.samples = self._read_labels()
 
     def _read_labels(self) -> list[tuple[str, np.ndarray]]:
@@ -115,6 +136,8 @@ class SilhouettePoseBBoxCropDataset(Dataset):
         image_path = self.root / rel_path
         arr = np.asarray(Image.open(image_path).convert("L"), dtype=np.uint8)
         cropped = bbox_crop_resize(arr, self.image_size, self.padding_factor)
+        if self.augment_resolution:
+            cropped = degrade_resolution(cropped, self.image_size, self.augment_min_scale)
         x = torch.from_numpy(cropped).unsqueeze(0)
         y = torch.from_numpy(quat)
         return x, y

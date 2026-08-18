@@ -11,6 +11,12 @@ SilhouettePoseBBoxCropDataset (前景bboxを一定の余白付きで切り出し
 をそのまま使う。bboxクロップ後の見え方は元の距離に依存しなくなるため、
 複数距離で再レンダリングし直す必要は無い、という想定に基づく。
 
+解像度劣化augmentationは、元のサンプルを劣化版に置き換えるのではなく、
+「綺麗な版」と「劣化させた版」を別々のサンプルとしてデータセットに追加する
+(ConcatDataset)。同じ元姿勢の綺麗版/劣化版が学習用・検証用に分かれて
+リークしないよう、姿勢のインデックス単位で先に train/val を分割してから
+両方に適用する。
+
 train.py は変更せず、このスクリプトとして独立に用意する。チェックポイントも
 既定で train.py とは別名(checkpoints/silhouette_pose_bboxcrop.pt)に保存する。
 
@@ -25,7 +31,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import ConcatDataset, DataLoader, Subset
 
 from bboxcrop_dataset import SilhouettePoseBBoxCropDataset
 from silhouette_pose.losses import (
@@ -43,6 +49,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-size", type=int, default=64)
     parser.add_argument("--padding-factor", type=float, default=1.25,
                          help="前景bboxの外側に取る余白の倍率 (距離によらず一定にする正規化)")
+    parser.add_argument("--no-augment-resolution", dest="augment_resolution",
+                         action="store_false",
+                         help="解像度劣化augmentation(遠距離のガタガタしたエッジを模擬した"
+                              "サンプルを追加すること)を無効化する")
+    parser.add_argument("--augment-min-scale", type=float, default=0.15,
+                         help="解像度劣化augmentationで許容する最小の縮小率")
+    parser.set_defaults(augment_resolution=True)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -96,19 +109,46 @@ def main() -> None:
     set_seed(args.seed)
     device = choose_device(args.device)
 
-    dataset = SilhouettePoseBBoxCropDataset(
+    clean_dataset = SilhouettePoseBBoxCropDataset(
         root=args.data_root,
         labels_csv=args.labels_csv,
         image_size=args.image_size,
         padding_factor=args.padding_factor,
+        augment_resolution=False,
     )
-    val_size = max(1, int(len(dataset) * args.val_ratio))
-    train_size = len(dataset) - val_size
-    train_set, val_set = random_split(
-        dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(args.seed),
-    )
+    n_samples = len(clean_dataset)
+    val_size = max(1, int(n_samples * args.val_ratio))
+
+    # 姿勢インデックス単位で先にtrain/valを分割する(綺麗版/劣化版が
+    # 別々に学習用・検証用へ漏れてリークするのを防ぐため)
+    perm = torch.randperm(n_samples, generator=torch.Generator().manual_seed(args.seed)).tolist()
+    val_indices = perm[:val_size]
+    train_indices = perm[val_size:]
+
+    if args.augment_resolution:
+        degraded_dataset = SilhouettePoseBBoxCropDataset(
+            root=args.data_root,
+            labels_csv=args.labels_csv,
+            image_size=args.image_size,
+            padding_factor=args.padding_factor,
+            augment_resolution=True,
+            augment_min_scale=args.augment_min_scale,
+        )
+        train_set = ConcatDataset([
+            Subset(clean_dataset, train_indices),
+            Subset(degraded_dataset, train_indices),
+        ])
+        val_set = ConcatDataset([
+            Subset(clean_dataset, val_indices),
+            Subset(degraded_dataset, val_indices),
+        ])
+    else:
+        train_set = Subset(clean_dataset, train_indices)
+        val_set = Subset(clean_dataset, val_indices)
+
+    print(f"学習データ: {len(train_set)}枚 (元姿勢{len(train_indices)}種"
+          f"{'x2 [綺麗+劣化]' if args.augment_resolution else ''})"
+          f"  検証データ: {len(val_set)}枚")
 
     train_loader = DataLoader(
         train_set,
@@ -179,6 +219,8 @@ def main() -> None:
                     "model": model.state_dict(),
                     "image_size": args.image_size,
                     "padding_factor": args.padding_factor,
+                    "augment_resolution": args.augment_resolution,
+                    "augment_min_scale": args.augment_min_scale,
                     "best_angle_deg": best_angle,
                 },
                 output,
