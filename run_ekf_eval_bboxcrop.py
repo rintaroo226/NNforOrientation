@@ -114,6 +114,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--p0-theta", type=float, default=0.5, help="初期共分散 (姿勢, 対角成分)")
     p.add_argument("--p0-omega", type=float, default=2.0,
                     help="初期共分散 (角速度, 対角成分)")
+    p.add_argument("--warmup-frames", type=int, default=0,
+                    help="最初のNフレームはゲーティングを無効化し、観測を無条件に採用する。"
+                         "q0/ω0は最初の(最も精度が悪いことが多い)フレームから決まるため、"
+                         "そこで大きく外すとゲートが以降の正しい観測まで棄却し続けてしまう"
+                         "リスクがある。ウォームアップ期間を設けることで、フィルタが物理"
+                         "モデルと実際の観測列を使って早期に正しい軌道へ収束できるようにする")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
@@ -214,10 +220,18 @@ def run_ekf_pass(
     if has_gt:
         ekf_err[0] = symmetry_aware_angle_error_deg(pred_quats[0], rows[0]["gt_q"])
 
+    warmup_frames = getattr(args, "warmup_frames", 0)
     for k in range(1, n):
         dt = rows[k]["t"] - rows[k - 1]["t"]
         ekf.predict(dt)
-        result = ekf.update(pred_quats[k])
+        if k <= warmup_frames:
+            # ウォームアップ中はゲートを無効化し、q0/ω0が悪くても実測列で早期に補正させる
+            original_gate_mode = ekf.config.gate_mode
+            ekf.config.gate_mode = "none"
+            result = ekf.update(pred_quats[k])
+            ekf.config.gate_mode = original_gate_mode
+        else:
+            result = ekf.update(pred_quats[k])
         q_est, _, _ = ekf.state()
         ekf_quats[k] = q_est
         accepted[k] = result.accepted
