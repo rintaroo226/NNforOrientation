@@ -29,12 +29,31 @@ target_size          = [3, 2, 1];  % [幅, 高さ, 奥行] (m)  train と同一
 dist_min = 9;
 dist_max = 60;
 
-save_dir  = 'database_random_multidistance';
+save_dir  = 'database_random_multidistance_10';
 image_dir = fullfile(save_dir, 'images');
 
 %% 出力先作成
 [~, ~] = mkdir(save_dir);
 [~, ~] = mkdir(image_dir);
+
+%% 途中で誤って再実行してしまっても最初からやり直さずに済むよう、
+%  既存の labels.csv があれば続きから再開する(無ければ新規作成)。
+csv_path = fullfile(save_dir, 'labels.csv');
+start_i = 1;
+if isfile(csv_path)
+    existing = readtable(csv_path);
+    start_i = height(existing) + 1;
+    if start_i > N
+        fprintf('既に %d 枚生成済みです (N=%d)。何もせず終了します。\n', height(existing), N);
+        return;
+    end
+    fprintf('既存の %s から %d 枚分の記録を検出。%d 枚目から再開します。\n', ...
+        csv_path, height(existing), start_i);
+    fid = fopen(csv_path, 'a');  % 追記モード (既存の内容は残す)
+else
+    fid = fopen(csv_path, 'w');
+    fprintf(fid, 'image,qw,qx,qy,qz,distance\n');
+end
 
 %% SO(3) 上で一様なクォータニオンをサンプリング（Shoemake の方法）
 rng(rng_seed);
@@ -56,17 +75,13 @@ pose.tx = 0;
 pose.ty = 0;
 
 %% レンダリングループ
-csv_path = fullfile(save_dir, 'labels.csv');
-fid = fopen(csv_path, 'w');
-fprintf(fid, 'image,qw,qx,qy,qz,distance\n');
-
 bin_threshold = 5;  % これより明るい画素を前景(255)とみなす（train と同一）
 
 fprintf('=== 距離ランダム化学習用データベース生成 (%d枚, distance in [%.1f, %.1f]) ===\n', ...
     N, dist_min, dist_max);
 tic;
 
-for i = 1:N
+for i = start_i:N
     q = [qw(i), qx(i), qy(i), qz(i)];
     [pose.pitch, pose.yaw, pose.roll] = quatToEulerZYX(q);
     pose.distance = distances(i);
